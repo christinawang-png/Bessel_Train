@@ -4,29 +4,32 @@ from pathlib import Path
 import numpy as np
 from numpy.fft import fft2, ifft2
 from scipy.io import loadmat
+from scipy.ndimage import map_coordinates
 import nibabel as nib
 
 # ---------- CONFIG ----------
-IN_VOL_DIR    = Path("MiniVess/post")  # 3D .nii.gz
-OUT_IDEAL_DIR = Path("MiniVess/out_ideal")
-OUT_NOISY_DIR = Path("MiniVess/out")
+IN_VOL_DIR    = Path("MiniVess/post")      # 3D .nii.gz
+OUT_IDEAL_DIR = Path("MiniVess/out_ideal_warp")
+OUT_NOISY_DIR = Path("MiniVess/out_warp")
 
-PSF_MAT_PATH  = Path("Example_PSF/64_33/psf_all_1.mat")  # or .m if it's actually a MAT-file
-PSF_KEY       = None  # or "psf_thisAngle" etc., if you know the variable name
+PSF_MAT_PATH  = Path("Example_PSF/64_33/psf_all_1.mat")
+PSF_KEY       = None                       # or "psf_thisAngle" if known
+
+# Warp controls (static, same for all samples)
+APPLY_WARP_TO_IDEAL = True    # apply warp to ideal image
+APPLY_WARP_TO_NOISY = True    # apply warp also to noisy image
+WARP_K              = 0.05    # radial distortion coefficient (sign/size controls strength)
 
 # Noise / artifact parameters
-JITTER_STD_PX   = 0.3    # per-line lateral jitter in pixels (0 to disable)
-GAIN_STD        = 0.03   # per-frame multiplicative gain std (0 to disable)
-POISSON_SCALE   = 500.0  # global intensity scale for Poisson
-READ_NOISE_STD  = 2.0    # Gaussian read noise in photon units
+ADD_NOISE      = True
+JITTER_STD_PX  = 0.3    # per-line lateral jitter in pixels (0 to disable)
+GAIN_STD       = 0.03   # per-frame multiplicative gain std (0 to disable)
+POISSON_SCALE  = 500.0  # global intensity scale for Poisson
+READ_NOISE_STD = 2.0    # Gaussian read noise in photon units
 # ----------------------------
 
 
 def load_psf_from_mat_single(mat_path: Path, key=None) -> np.ndarray:
-    """
-    Load a single 3D PSF from a .mat (or .m) file.
-    Returns psf as float32 with shape (Z, Y, X), normalized by max value.
-    """
     mat = loadmat(mat_path)
     if key is not None:
         psf = mat[key]
@@ -44,28 +47,16 @@ def load_psf_from_mat_single(mat_path: Path, key=None) -> np.ndarray:
             raise ValueError("No 3D array found in MAT file; specify PSF_KEY.")
 
     psf = np.asarray(psf, dtype=np.float32)
-
-    # If needed, transpose here so that psf[z, y, x] is a z-slice:
-    # e.g. if loaded as (Y, X, Z), do psf = np.transpose(psf, (2, 0, 1))
-    # Adjust this once by printing psf.shape and checking.
-    # Example (commented out):
+    # loaded as (X, Y, Z) -> (Z, Y, X)
     psf = np.transpose(psf, (2, 1, 0))
-
-    # Normalize by maximum (like your MATLAB 'norm' option)
     psf_max = psf.max()
     if psf_max > 0:
         psf /= psf_max
-
     print(f"[PSF] Final PSF shape (Z, Y, X): {psf.shape}, max={psf.max():.4g}")
     return psf
 
 
 def match_z_to_psf(volume_zyx: np.ndarray, psf_zyx: np.ndarray) -> np.ndarray:
-    """
-    Clip or pad the volume along Z so that its depth matches the PSF depth,
-    following the spirit of your MATLAB code.
-    volume_zyx, psf_zyx both shape (Z, Y, X).
-    """
     Zv, H, W = volume_zyx.shape
     Zp, _, _ = psf_zyx.shape
 
@@ -73,22 +64,17 @@ def match_z_to_psf(volume_zyx: np.ndarray, psf_zyx: np.ndarray) -> np.ndarray:
         return volume_zyx
 
     if Zv > Zp:
-        # Clip symmetrically
         diff = Zv - Zp
         if diff % 2 != 0:
-            # If odd, drop one slice to make it even (similar to your odd/even handling)
             Zv -= 1
             volume_zyx = volume_zyx[:Zv, :, :]
             diff = Zv - Zp
         clip = diff // 2
         print(f"  [Z] Clipping volume Z from {Zv + diff} to {Zp}, removing {clip} slices each side")
         return volume_zyx[clip:clip + Zp, :, :]
-
     else:
-        # Zv < Zp: pad with zeros symmetrically
         diff = Zp - Zv
         if diff % 2 != 0:
-            # make diff even
             diff -= 1
         pad = diff // 2
         print(f"  [Z] Padding volume Z from {Zv} to {Zp}, adding {pad} slices each side")
@@ -98,46 +84,66 @@ def match_z_to_psf(volume_zyx: np.ndarray, psf_zyx: np.ndarray) -> np.ndarray:
 
 
 def forward_proj_rl(psf_zyx: np.ndarray, volume_zyx: np.ndarray) -> np.ndarray:
-    """
-    Python equivalent of forwardProj_RL_GPU for one PSF and one volume.
-    psf_zyx, volume_zyx: shape (Z, Y, X).
-    Returns 2D projection (Y, X).
-    """
     psf_zyx = np.asarray(psf_zyx, dtype=np.float32)
     volume_zyx = np.asarray(volume_zyx, dtype=np.float32)
 
     Za, Ha, Wa = volume_zyx.shape
     Zb, Hb, Wb = psf_zyx.shape
-
     if Za != Zb:
         raise ValueError(f"Z mismatch after matching: vol Z={Za}, psf Z={Zb}")
 
     r = Ha + Hb
     c = Wa + Wb
-    p1 = (r - Ha) // 2
-    p2 = (c - Wa) // 2
-
     a1 = np.zeros((r, c), dtype=np.float32)
     b1 = np.zeros((r, c), dtype=np.float32)
     projection = np.zeros((Ha, Wa), dtype=np.float32)
 
+    row_start = (r - Ha) // 2
+    col_start = (c - Wa) // 2
+    row_end = row_start + Ha
+    col_end = col_start + Wa
+
     for z in range(Za):
-        # top-left placement (like MATLAB a1(1:ra,1:ca) = Xguess(:,:,z))
         a1[:Ha, :Wa] = volume_zyx[z, :, :]
         b1[:Hb, :Wb] = psf_zyx[z, :, :]
-
         con1 = ifft2(fft2(a1) * fft2(b1))
         con1_real = con1.real.astype(np.float32)
-
-        # Compute crop indices so that crop size is exactly (Ha, Wa)
-        row_start = (r - Ha) // 2
-        col_start = (c - Wa) // 2
-        row_end = row_start + Ha
-        col_end = col_start + Wa
-        
         projection += con1_real[row_start:row_end, col_start:col_end]
 
     return projection
+
+
+def apply_static_warp(img2d: np.ndarray, k: float = WARP_K) -> np.ndarray:
+    """
+    Static radial barrel/pincushion warp.
+    k > 0  -> barrel (stretches toward edges)
+    k < 0  -> pincushion
+    """
+    if k == 0.0:
+        return img2d
+
+    img = np.asarray(img2d, dtype=np.float32)
+    H, W = img.shape
+
+    # normalized coordinates centered at 0
+    y, x = np.meshgrid(
+        np.linspace(-1, 1, H, dtype=np.float32),
+        np.linspace(-1, 1, W, dtype=np.float32),
+        indexing="ij",
+    )
+    r2 = x**2 + y**2
+    # radial distortion
+    factor = 1.0 + k * r2
+    x_dist = x * factor
+    y_dist = y * factor
+
+    # map back to pixel coordinates
+    x_pix = ((x_dist + 1) * 0.5) * (W - 1)
+    y_pix = ((y_dist + 1) * 0.5) * (H - 1)
+
+    coords = np.vstack([y_pix.ravel(), x_pix.ravel()])
+    warped = map_coordinates(img, coords, order=1, mode="nearest").reshape(H, W)
+    return warped
 
 
 def add_noise_and_artifacts(
@@ -146,11 +152,11 @@ def add_noise_and_artifacts(
     gain_std: float = GAIN_STD,
     poisson_scale: float = POISSON_SCALE,
     read_noise_std: float = READ_NOISE_STD,
+    enabled: bool = True,
 ) -> np.ndarray:
-    """
-    Take an ideal 2D image and make a noisy, device-like version.
-    Returns noisy_img (same shape as img2d).
-    """
+    if not enabled:
+        return np.asarray(img2d, dtype=np.float32)
+
     ideal = np.asarray(img2d, dtype=np.float32)
     H, W = ideal.shape
 
@@ -193,7 +199,6 @@ def main():
     OUT_IDEAL_DIR.mkdir(parents=True, exist_ok=True)
     OUT_NOISY_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load a single 3D PSF and normalize by max
     psf_zyx = load_psf_from_mat_single(PSF_MAT_PATH, key=PSF_KEY)
 
     nii_exts = (".nii", ".nii.gz")
@@ -204,28 +209,31 @@ def main():
         in_path = IN_VOL_DIR / fname
         print(f"[VOLUME] {in_path}")
         img = nib.load(str(in_path))
-        vol = img.get_fdata()  # often (Y, X, Z) or (X, Y, Z), depends on how it was saved
+        vol = img.get_fdata().astype(np.float32)
 
-        # Decide how to get (Z, Y, X). If vol.shape looks like (H, W, Z):
+        # Assume (H, W, Z) -> (Z, H, W)
         if vol.ndim == 3 and vol.shape[2] != img.shape[0]:
-            # likely (H, W, Z) -> (Z, H, W)
             volume_zyx = np.transpose(vol, (2, 0, 1))
         elif vol.ndim == 3:
-            # If it's already (Z, H, W), then:
             volume_zyx = vol
         else:
             raise ValueError(f"Unexpected volume shape {vol.shape} for {in_path}")
 
-        # Match Z dimension to PSF
         volume_zyx = match_z_to_psf(volume_zyx, psf_zyx)
 
-        # Forward projection: ideal 2D
+        # Ideal forward
         ideal2d = forward_proj_rl(psf_zyx, volume_zyx)
 
-        # Noisy version
-        noisy2d = add_noise_and_artifacts(ideal2d)
+        # Apply static warp to ideal if desired
+        if APPLY_WARP_TO_IDEAL:
+            ideal2d = apply_static_warp(ideal2d, k=WARP_K)
 
-        # Save as 2D NIfTI (Y, X) with identity affine
+        # Noisy version (optionally warped again or just noise on warped ideal)
+        noisy2d = add_noise_and_artifacts(
+            ideal2d if APPLY_WARP_TO_NOISY else forward_proj_rl(psf_zyx, volume_zyx),
+            enabled=ADD_NOISE,
+        )
+
         stem = fname
         if stem.endswith(".nii.gz"):
             stem = stem[:-7]
