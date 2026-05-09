@@ -6,11 +6,12 @@ from numpy.fft import fft2, ifft2
 from scipy.io import loadmat
 from scipy.ndimage import map_coordinates
 import nibabel as nib
+import matplotlib.pyplot as plt
 
 # ---------- CONFIG ----------
 IN_VOL_DIR    = Path("MiniVess/post")      # 3D .nii.gz
-OUT_IDEAL_DIR = Path("MiniVess/out_ideal_warp")
-OUT_NOISY_DIR = Path("MiniVess/out_warp")
+OUT_IDEAL_DIR = Path("MiniVess/out_ideal_2")
+OUT_NOISY_DIR = Path("MiniVess/out_2")
 
 PSF_MAT_PATH  = Path("Example_PSF/64_33/psf_all_1.mat")
 PSF_KEY       = None                       # or "psf_thisAngle" if known
@@ -18,7 +19,7 @@ PSF_KEY       = None                       # or "psf_thisAngle" if known
 # Warp controls (static, same for all samples)
 APPLY_WARP_TO_IDEAL = True    # apply warp to ideal image
 APPLY_WARP_TO_NOISY = True    # apply warp also to noisy image
-WARP_K              = 0.05    # radial distortion coefficient (sign/size controls strength)
+WARP_K              = 0.2    # radial distortion coefficient (sign/size controls strength)
 
 # Noise / artifact parameters
 ADD_NOISE      = True
@@ -83,7 +84,19 @@ def match_z_to_psf(volume_zyx: np.ndarray, psf_zyx: np.ndarray) -> np.ndarray:
         return np.concatenate([pad_before, volume_zyx, pad_after], axis=0)
 
 
-def forward_proj_rl(psf_zyx: np.ndarray, volume_zyx: np.ndarray) -> np.ndarray:
+def forward_proj_rl(psf_zyx: np.ndarray, volume_zyx: np.ndarray,
+                    pad_xy: int = 16) -> np.ndarray:
+    """
+    FFT-based forward projector with reflective boundary handling in XY.
+
+    Strategy:
+      - Reflect-pad both volume slice and PSF slice in XY by pad_xy.
+      - Do the same FFT-based convolution on the padded grids.
+      - Crop back to the original (Ha, Wa) region.
+
+    psf_zyx, volume_zyx: (Z, Y, X)
+    pad_xy: how many pixels to reflect-pad on each side in X,Y (tradeoff: quality vs speed).
+    """
     psf_zyx = np.asarray(psf_zyx, dtype=np.float32)
     volume_zyx = np.asarray(volume_zyx, dtype=np.float32)
 
@@ -92,57 +105,75 @@ def forward_proj_rl(psf_zyx: np.ndarray, volume_zyx: np.ndarray) -> np.ndarray:
     if Za != Zb:
         raise ValueError(f"Z mismatch after matching: vol Z={Za}, psf Z={Zb}")
 
-    r = Ha + Hb
-    c = Wa + Wb
-    a1 = np.zeros((r, c), dtype=np.float32)
-    b1 = np.zeros((r, c), dtype=np.float32)
+    # Reflect-pad slices in XY
+    Ha_pad = Ha + 2 * pad_xy
+    Wa_pad = Wa + 2 * pad_xy
+
     projection = np.zeros((Ha, Wa), dtype=np.float32)
 
-    row_start = (r - Ha) // 2
-    col_start = (c - Wa) // 2
-    row_end = row_start + Ha
-    col_end = col_start + Wa
-
     for z in range(Za):
-        a1[:Ha, :Wa] = volume_zyx[z, :, :]
-        b1[:Hb, :Wb] = psf_zyx[z, :, :]
+        vol_slice = np.pad(
+            volume_zyx[z, :, :],
+            ((pad_xy, pad_xy), (pad_xy, pad_xy)),
+            mode="reflect",
+        )
+        psf_slice = np.pad(
+            psf_zyx[z, :, :],
+            ((pad_xy, pad_xy), (pad_xy, pad_xy)),
+            mode="reflect",
+        )
+
+        # sizes for FFT-based linear convolution on padded grid
+        rb = Ha_pad + Hb
+        cb = Wa_pad + Wb
+        a1 = np.zeros((rb, cb), dtype=np.float32)
+        b1 = np.zeros((rb, cb), dtype=np.float32)
+
+        a1[:Ha_pad, :Wa_pad] = vol_slice
+        b1[:Hb + 2 * pad_xy, :Wb + 2 * pad_xy] = psf_slice
+
         con1 = ifft2(fft2(a1) * fft2(b1))
         con1_real = con1.real.astype(np.float32)
-        projection += con1_real[row_start:row_end, col_start:col_end]
+
+        # crop center (Ha_pad, Wa_pad), then crop away the reflected border
+        row_start = (rb - Ha_pad) // 2
+        col_start = (cb - Wa_pad) // 2
+        row_end = row_start + Ha_pad
+        col_end = col_start + Wa_pad
+
+        conv_pad = con1_real[row_start:row_end, col_start:col_end]
+        projection += conv_pad[pad_xy:pad_xy + Ha, pad_xy:pad_xy + Wa]
 
     return projection
 
 
 def apply_static_warp(img2d: np.ndarray, k: float = WARP_K) -> np.ndarray:
-    """
-    Static radial barrel/pincushion warp.
-    k > 0  -> barrel (stretches toward edges)
-    k < 0  -> pincushion
-    """
     if k == 0.0:
         return img2d
 
     img = np.asarray(img2d, dtype=np.float32)
     H, W = img.shape
 
-    # normalized coordinates centered at 0
     y, x = np.meshgrid(
         np.linspace(-1, 1, H, dtype=np.float32),
         np.linspace(-1, 1, W, dtype=np.float32),
         indexing="ij",
     )
-    r2 = x**2 + y**2
-    # radial distortion
-    factor = 1.0 + k * r2
+    r = np.sqrt(x**2 + y**2)
+
+    # only warp inside r<=0.8, fade to 0 between 0.8 and 1.0
+    r0, r1 = 0.8, 1.0
+    w = np.clip((r1 - r) / (r1 - r0), 0.0, 1.0)  # 1 in center, 0 at edges
+    factor = 1.0 + k * (r**2) * w
+
     x_dist = x * factor
     y_dist = y * factor
 
-    # map back to pixel coordinates
     x_pix = ((x_dist + 1) * 0.5) * (W - 1)
     y_pix = ((y_dist + 1) * 0.5) * (H - 1)
 
     coords = np.vstack([y_pix.ravel(), x_pix.ravel()])
-    warped = map_coordinates(img, coords, order=1, mode="nearest").reshape(H, W)
+    warped = map_coordinates(img, coords, order=1, mode="reflect").reshape(H, W)
     return warped
 
 
@@ -202,6 +233,22 @@ def main():
     psf_zyx = load_psf_from_mat_single(PSF_MAT_PATH, key=PSF_KEY)
 
     nii_exts = (".nii", ".nii.gz")
+    
+    H, W = 256, 256
+    step = 16  # size of grid cells
+    yy, xx = np.indices((H, W))
+    grid = ((xx % step == 0) | (yy % step == 0)).astype(np.float32)
+    
+    k = 0.2
+    warped = apply_static_warp(grid, k=k)
+    
+    plt.figure(figsize=(6, 3))
+    plt.subplot(1, 2, 1); plt.imshow(grid, cmap="gray"); plt.title("Original"); plt.axis("off")
+    plt.subplot(1, 2, 2); plt.imshow(warped, cmap="gray"); plt.title(f"Warped k={k}"); plt.axis("off")
+    plt.tight_layout()
+    plt.savefig("warp_grid_k_{:.3f}.png".format(k), dpi=150)
+    plt.close()
+    
     for fname in os.listdir(IN_VOL_DIR):
         if not fname.lower().endswith(nii_exts):
             continue
